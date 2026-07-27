@@ -1,0 +1,11 @@
+torch>=2.0
+torchvision
+numpy
+Pillow
+faiss-cpu
+opencv-python
+tqdm
+aiohttp
+streetlevel
+equilib
+omegaconf

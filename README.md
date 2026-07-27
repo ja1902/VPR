@@ -1,0 +1,155 @@
+# Visual Place Recognition
+
+City-scale visual geolocation system. Given a photo or video, it identifies where it was taken by matching against a pre-built reference database of street-level imagery.
+
+## How It Works
+
+```
+┌─────────────────────────── OFFLINE (setup) ──────────────────────────────┐
+│                                                                          │
+│  Coordinates ──► Harvest Street  ──► Reproject to  ──► Filter blurry/   │
+│  (bounding box)   View panoramas     6 perspectives     dark images      │
+│                                                                          │
+│                  ──► Extract SALAD  ──► Build FAISS                      │
+│                      descriptors       search index                      │
+│                                                                          │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────── ONLINE (query) ───────────────────────────────┐
+│                                                                          │
+│  Photo/Video ──► SALAD descriptor ──► FAISS nearest  ──► Pair-VPR       │
+│                  (8448-dim)           neighbour search    re-ranking*    │
+│                                                                          │
+│                  ──► Weighted centroid ──► GPS coordinates               │
+│                                                                          │
+│  * Re-ranking is adaptive: only triggered when top matches are close    │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+**Core components:**
+
+- **DINOv2-SALAD** — Produces 8448-dimensional global descriptors that capture visual identity of a scene, invariant to lighting and viewpoint changes
+- **FAISS IndexFlatL2** — Brute-force L2 search over the reference descriptor database for fast nearest-neighbour retrieval
+- **Pair-VPR** — Cross-attention re-ranker using DINOv2 ViT-B/14 dense features, triggered adaptively when FAISS results are ambiguous (top-1/top-2 margin < 0.15)
+- **SeqGeM pooling** — Temporal pooling for video queries: collapses per-frame descriptors into a single query vector using generalised mean pooling (p=3)
+- **Weighted centroid** — Final coordinates computed as a weighted average of the top-M matches
+
+## Features
+
+- **Image queries** — geolocate a single photo
+- **Video queries** — geolocate a video clip using temporal pooling across sampled frames
+- **Adaptive re-ranking** — Pair-VPR only runs when needed, saving compute on confident matches
+- **Dashcam/CCTV support** — automatic letterbox detection and configurable HUD crop
+- **Area-agnostic** — works for any region with street-level imagery coverage
+
+## Quick Start
+
+### Requirements
+
+- Python 3.10+
+- CUDA GPU recommended (CPU works but feature extraction is slow)
+- ~5 GB disk for model weights + reference data (varies with area size)
+
+### Setup
+
+```bash
+git clone https://github.com/ja1902/VPR.git && cd VPR
+./setup.sh
+```
+
+The setup script will:
+1. Create a virtual environment and install dependencies
+2. Download pre-trained weights (~1.8 GB from GitHub release)
+3. Ask you for the bounding box of the area you want to cover
+4. Build the reference database (harvest panoramas, extract features, build index)
+
+### Query
+
+Activate the virtual environment first:
+
+```bash
+source venv/bin/activate
+```
+
+**Geolocate a photo:**
+
+```bash
+python query.py image photo.jpg
+python query.py image photo.jpg --rerank
+```
+
+**Geolocate a video:**
+
+```bash
+python query.py video clip.mp4
+python query.py video clip.mp4 --rerank
+python query.py video dashcam.mp4 --rerank --crop 10,25
+```
+
+### Options
+
+| Flag | Description |
+|------|-------------|
+| `--rerank` | Enable adaptive Pair-VPR re-ranking for higher accuracy |
+| `--top_k N` | Number of results to return (default: 10) |
+| `--fps N` | Video frame sampling rate in Hz (default: 2.0) |
+| `--max_frames N` | Maximum frames to extract from video (default: 15) |
+| `--crop T,B` | Crop top T% and bottom B% of video frames (for dashcam HUD overlays) |
+
+## Project Structure
+
+```
+VPR/
+├── setup.sh                  # One-command setup
+├── query.py                  # Unified CLI entry point
+├── vpr/                      # Core package
+│   ├── config.py             # Configuration (loads from .env)
+│   ├── model_utils.py        # SALAD model loading
+│   ├── pairvpr_utils.py      # Pair-VPR model loading and re-ranking
+│   ├── harvest.py            # Download street-level panoramas
+│   ├── reproject.py          # Equirectangular → perspective views
+│   ├── filter_images.py      # Remove blurry/dark images
+│   ├── extract_features.py   # Extract SALAD descriptors
+│   ├── build_index.py        # Build FAISS search index
+│   ├── query_image.py        # Image query engine
+│   └── query_video.py        # Video query engine
+├── .env                      # Area coordinates (generated by setup)
+├── requirements.txt          # Python dependencies
+├── salad/                    # SALAD model (vendored)
+├── dinov2/                   # DINOv2 model (vendored)
+├── Pair-VPR/                 # Pair-VPR model (vendored)
+├── weights/                  # Model weights (downloaded by setup)
+└── data/                     # Reference database (built by setup)
+    ├── panoramas/            # Raw street-level panoramas
+    ├── perspectives/         # Reprojected perspective images
+    ├── features/             # SALAD descriptor arrays
+    └── index/                # FAISS index + ID map
+```
+
+## Configuration
+
+The `.env` file controls the target region:
+
+```env
+MIN_LAT=51.435      # South boundary
+MAX_LAT=51.475      # North boundary
+MIN_LON=-2.615      # West boundary
+MAX_LON=-2.545      # East boundary
+GRID_STEP_M=20      # Sampling density in meters
+```
+
+To cover a different area, edit `.env` and re-run the offline pipeline:
+
+```bash
+python -m vpr.harvest
+python -m vpr.filter_images
+python -m vpr.extract_features
+python -m vpr.build_index
+```
+
+## Limitations
+
+- Accuracy depends on street-level imagery coverage in the target area
+- Queries outside the reference area will return the nearest in-coverage match (no out-of-range detection)
+- Video queries work best on continuous footage of one location — clips with scene cuts or unrelated content will produce unreliable results
+- Large areas require significant disk space and processing time for the offline pipeline

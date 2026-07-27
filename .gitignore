@@ -1,0 +1,9 @@
+data/
+weights/
+__pycache__/
+*.pyc
+.env
+vid/
+img/
+venv/
+*.egg-info/
