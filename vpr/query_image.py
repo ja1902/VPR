@@ -21,6 +21,7 @@ from . import config
 from .model_utils import load_salad_model, get_transform
 
 RERANK_MARGIN_THRESHOLD = 0.15
+OOR_PAIRVPR_THRESHOLD = 0.0
 CENTROID_TOP_M = 5
 
 
@@ -155,6 +156,12 @@ def query(image_path, top_k=config.TOP_K, do_rerank=False):
         })
 
     print_results(f"\nPair-VPR re-ranked top {min(top_k, len(reranked_results))}:", reranked_results[:top_k], id_map)
+
+    best_score = reranked_results[0]["score"]
+    print(f"\nOOR check: best Pair-VPR score={best_score:.4f} (threshold={OOR_PAIRVPR_THRESHOLD})")
+    if best_score < OOR_PAIRVPR_THRESHOLD:
+        print("OUT OF RANGE — Pair-VPR confirms no good match exists.")
+        return
 
     rerank_lat, rerank_lon = weighted_centroid(reranked_results, CENTROID_TOP_M)
     if rerank_lat is not None:

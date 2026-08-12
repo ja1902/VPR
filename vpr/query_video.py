@@ -1,8 +1,8 @@
 """
 Query the FAISS index with a video to find the closest matching location.
 Extracts frames at a configurable FPS, computes per-frame SALAD descriptors,
-applies SeqGeM temporal pooling to produce a single 8448-dim query vector,
-then runs FAISS search with optional adaptive Pair-VPR re-ranking.
+queries each frame individually, then uses geographic clustering of per-frame
+matches to determine if the query is in-range and resolve the final location.
 
 Usage:
     python 07_query_video.py <video_path>
@@ -22,7 +22,12 @@ from PIL import Image
 
 from . import config
 from .model_utils import load_salad_model, get_transform
-from .query_image import weighted_centroid, print_results, RERANK_MARGIN_THRESHOLD, CENTROID_TOP_M
+from .query_image import (weighted_centroid, print_results,
+                          RERANK_MARGIN_THRESHOLD, CENTROID_TOP_M)
+
+CLUSTER_RADIUS_M = 100
+MIN_INLIER_RATIO = 0.4
+MIN_INLIER_COUNT = 3
 
 
 def clean_frame(pil_img, crop_pct=None):
@@ -99,6 +104,28 @@ def seqgem_pool(descriptors, p=3.0, eps=1e-6):
     return pooled.squeeze(0).squeeze(-1)  # (D,)
 
 
+def _geo_distance_m(lat1, lon1, lat2, lon2):
+    dlat = (lat2 - lat1) * config.METERS_PER_DEGREE_LAT
+    dlon = (lon2 - lon1) * config.METERS_PER_DEGREE_LON
+    return (dlat ** 2 + dlon ** 2) ** 0.5
+
+
+def _find_largest_cluster(frame_locations, radius_m):
+    """Find the largest group of frame locations within radius_m of each other.
+    frame_locations: list of (frame_idx, lat, lon)
+    Returns: list of indices into frame_locations for the best cluster.
+    """
+    best_inliers = []
+    for i, (_, lat_i, lon_i) in enumerate(frame_locations):
+        inliers = []
+        for j, (_, lat_j, lon_j) in enumerate(frame_locations):
+            if _geo_distance_m(lat_i, lon_i, lat_j, lon_j) <= radius_m:
+                inliers.append(j)
+        if len(inliers) > len(best_inliers):
+            best_inliers = inliers
+    return best_inliers
+
+
 def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
                 max_frames=config.VIDEO_MAX_FRAMES,
                 top_k=config.TOP_K, do_rerank=False, crop_pct=None):
@@ -132,26 +159,62 @@ def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
 
     print(f"Computed {descriptors.shape[0]} frame descriptors ({descriptors.shape[1]}-dim)")
 
-    if descriptors.shape[0] == 1:
-        print("Single frame — skipping temporal pooling")
-        query_descriptor = descriptors.numpy().astype(np.float32)
-    else:
-        pooled = seqgem_pool(descriptors, p=3.0)
-        query_descriptor = pooled.unsqueeze(0).numpy().astype(np.float32)
-        print(f"SeqGeM pooled {descriptors.shape[0]} frames → single {query_descriptor.shape[1]}-dim descriptor")
+    frame_descriptors = descriptors.numpy().astype(np.float32)
+    per_frame_k = max(top_k, 100) if do_rerank else top_k
+    distances, indices = index.search(frame_descriptors, per_frame_k)
 
-    retrieval_k = max(top_k, 100) if do_rerank else top_k
-    distances, indices = index.search(query_descriptor, retrieval_k)
-
-    faiss_results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx == -1:
-            continue
-        meta = id_map[int(idx)]
-        faiss_results.append({"distance": float(dist), "meta": meta, "idx": int(idx)})
-
+    frame_locations = []
+    frame_results = []
     print(f"\nQuery: {video_path}")
-    print_results(f"FAISS top {min(top_k, len(faiss_results))} matches:", faiss_results[:top_k], id_map)
+    print(f"\nPer-frame top-1 matches:")
+    for f_idx in range(len(frames)):
+        results = []
+        for dist, idx in zip(distances[f_idx], indices[f_idx]):
+            if idx == -1:
+                continue
+            results.append({"distance": float(dist), "meta": id_map[int(idx)], "idx": int(idx)})
+        frame_results.append(results)
+
+        if results:
+            meta = results[0]["meta"]
+            lat, lon = meta.get("lat"), meta.get("lon")
+            if lat is not None and lon is not None:
+                frame_locations.append((f_idx, lat, lon))
+                print(f"  Frame {f_idx:2d}: lat={lat:.6f}, lon={lon:.6f}  d={distances[f_idx][0]:.4f}")
+            else:
+                print(f"  Frame {f_idx:2d}: match has no coordinates  d={distances[f_idx][0]:.4f}")
+        else:
+            print(f"  Frame {f_idx:2d}: no match")
+
+    if len(frame_locations) < 2:
+        print("Not enough frames with valid locations.")
+        return
+
+    best_inliers = _find_largest_cluster(frame_locations, CLUSTER_RADIUS_M)
+    inlier_ratio = len(best_inliers) / len(frames)
+    inlier_frame_indices = {frame_locations[i][0] for i in best_inliers}
+    center_lat = np.mean([frame_locations[i][1] for i in best_inliers])
+    center_lon = np.mean([frame_locations[i][2] for i in best_inliers])
+
+    print(f"\nOOR check: {len(best_inliers)}/{len(frames)} frames cluster within {CLUSTER_RADIUS_M}m "
+          f"({inlier_ratio:.0%}, threshold={MIN_INLIER_RATIO:.0%}, min count={MIN_INLIER_COUNT})")
+    print(f"  Cluster center: ({center_lat:.6f}, {center_lon:.6f})")
+    print(f"  Inlier frames: {[i for i in sorted(inlier_frame_indices)]}")
+
+    if inlier_ratio < MIN_INLIER_RATIO or len(best_inliers) < MIN_INLIER_COUNT:
+        print("OUT OF RANGE — no geographic consensus among frames.")
+        return
+
+    merged = {}
+    for f_idx in sorted(inlier_frame_indices):
+        for r in frame_results[f_idx][:top_k]:
+            idx = r["idx"]
+            if idx not in merged or r["distance"] < merged[idx]["distance"]:
+                merged[idx] = r
+    faiss_results = sorted(merged.values(), key=lambda r: r["distance"])
+
+    print_results(f"Merged top {min(top_k, len(faiss_results))} from inlier frames:",
+                  faiss_results[:top_k], id_map)
 
     faiss_lat, faiss_lon = weighted_centroid(faiss_results, CENTROID_TOP_M)
     if faiss_lat is not None:
@@ -183,8 +246,8 @@ def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
     pair_model = load_pair_vpr_model(device)
     pair_transform = get_transform()
 
-    best_frame = frames[0]
-    query_tensor = pair_transform(best_frame).unsqueeze(0)
+    best_frame_idx = sorted(inlier_frame_indices)[0]
+    query_tensor = pair_transform(frames[best_frame_idx]).unsqueeze(0)
     query_feats, _ = extract_dense_features(pair_model, query_tensor, device)
 
     candidate_feats = []

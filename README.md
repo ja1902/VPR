@@ -1,6 +1,30 @@
 # Visual Place Recognition
 
-City-scale visual geolocation system. Given a photo or video, it identifies where it was taken by matching against a pre-built reference database of street-level imagery.
+Visual geolocation system. Given a photo or video, it identifies where it was taken by matching against a pre-built reference database of street-level imagery.
+
+## v0.2.0 — What Changed
+
+### Out-of-range detection
+
+The system now detects when a query is outside the reference area instead of silently returning the nearest (wrong) match.
+
+**Video queries — per-frame geographic clustering:**
+- Each video frame is queried against FAISS individually instead of being pooled into a single descriptor
+- The per-frame top-1 matches are clustered geographically: if enough frames agree on a location (within 100m), the query is in-range
+- If fewer than 40% of frames (or fewer than 3 frames) cluster together, the query is flagged as out-of-range
+- This naturally handles shaky or low-quality video — good frames still cluster while junk frames (pointing at the ground, sky, etc.) are filtered out as outliers
+
+**Image queries — Pair-VPR score thresholding:**
+- When `--rerank` is used and Pair-VPR runs, the best re-ranking score is checked against a threshold
+- A score below 0 indicates no genuine visual match exists and the query is flagged as out-of-range
+- Requires `--rerank` to be passed (Pair-VPR must run for the check to work)
+
+### Video pipeline overhaul
+
+- **Removed SeqGeM pooling** — previously, all frame descriptors were pooled into a single query vector. This broke when frames showed diverse scenes (e.g. driving through a city) because the pooled descriptor became too generic to match anything
+- **Per-frame FAISS search** — each frame now queries the index independently, producing its own top-k matches
+- **Inlier-based result merging** — after geographic clustering identifies reliable frames, their FAISS results are merged (deduplicated by reference image, keeping the best distance) to produce the final ranked list
+- **Pair-VPR re-ranking** now uses the first inlier frame as the query image instead of always using frame 0
 
 ## How It Works
 
@@ -15,14 +39,28 @@ City-scale visual geolocation system. Given a photo or video, it identifies wher
 │                                                                          │
 └──────────────────────────────────────────────────────────────────────────┘
 
-┌─────────────────────────── ONLINE (query) ───────────────────────────────┐
+┌─────────────────────────── ONLINE (image query) ─────────────────────────┐
 │                                                                          │
-│  Photo/Video ──► SALAD descriptor ──► FAISS nearest  ──► Pair-VPR       │
-│                  (8448-dim)           neighbour search    re-ranking*    │
+│  Photo ──► SALAD descriptor ──► FAISS nearest  ──► Pair-VPR             │
+│            (8448-dim)           neighbour search    re-ranking*          │
 │                                                                          │
-│                  ──► Weighted centroid ──► GPS coordinates               │
+│          ──► OOR check** ──► Weighted centroid ──► GPS coordinates       │
 │                                                                          │
 │  * Re-ranking is adaptive: only triggered when top matches are close    │
+│  ** Out-of-range detection via Pair-VPR score (requires --rerank)       │
+└──────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────── ONLINE (video query) ─────────────────────────┐
+│                                                                          │
+│  Video ──► Extract frames ──► Per-frame SALAD ──► Per-frame FAISS       │
+│                                descriptors        search                │
+│                                                                          │
+│          ──► Geographic clustering ──► OOR check ──► Merge inlier       │
+│              of per-frame matches                    results             │
+│                                                                          │
+│          ──► Pair-VPR re-ranking* ──► Weighted centroid ──► GPS         │
+│                                                                          │
+│  * Adaptive, uses first inlier frame as query                           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -31,13 +69,13 @@ City-scale visual geolocation system. Given a photo or video, it identifies wher
 - **DINOv2-SALAD** — Produces 8448-dimensional global descriptors that capture visual identity of a scene, invariant to lighting and viewpoint changes
 - **FAISS IndexFlatL2** — Brute-force L2 search over the reference descriptor database for fast nearest-neighbour retrieval
 - **Pair-VPR** — Cross-attention re-ranker using DINOv2 ViT-B/14 dense features, triggered adaptively when FAISS results are ambiguous (top-1/top-2 margin < 0.15)
-- **SeqGeM pooling** — Temporal pooling for video queries: collapses per-frame descriptors into a single query vector using generalised mean pooling (p=3)
+- **Per-frame voting** — Video queries search each frame independently; geographic clustering of per-frame matches determines consensus and filters outliers
 - **Weighted centroid** — Final coordinates computed as a weighted average of the top-M matches
 
 ## Features
 
-- **Image queries** — geolocate a single photo
-- **Video queries** — geolocate a video clip using temporal pooling across sampled frames
+- **Image queries** — geolocate a single photo with optional out-of-range detection via Pair-VPR
+- **Video queries** — geolocate a video clip using per-frame voting with geographic clustering and out-of-range detection
 - **Adaptive re-ranking** — Pair-VPR only runs when needed, saving compute on confident matches
 - **Dashcam/CCTV support** — automatic letterbox detection and configurable HUD crop
 - **Area-agnostic** — works for any region with street-level imagery coverage
@@ -150,6 +188,6 @@ python -m vpr.build_index
 ## Limitations
 
 - Accuracy depends on street-level imagery coverage in the target area
-- Queries outside the reference area will return the nearest in-coverage match (no out-of-range detection)
+- Out-of-range detection for images requires `--rerank` (Pair-VPR must run); without it, queries outside the reference area will return the nearest in-coverage match
 - Video queries work best on continuous footage of one location — clips with scene cuts or unrelated content will produce unreliable results
 - Large areas require significant disk space and processing time for the offline pipeline
