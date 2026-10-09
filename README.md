@@ -97,7 +97,7 @@ git clone https://github.com/ja1902/VPR.git && cd VPR
 
 The setup script will:
 1. Create a virtual environment and install dependencies
-2. Download pre-trained weights (~1.8 GB from GitHub release)
+2. Download pre-trained weights (~1.8 GB from the official SALAD, DINOv2 and Pair-VPR sources)
 3. Ask you for the bounding box of the area you want to cover
 4. Build the reference database (harvest panoramas, extract features, build index)
 

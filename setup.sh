@@ -55,8 +55,10 @@ echo "       Done."
 
 # ── 3. Download model weights ────────────────────────────────────
 # Model repos (salad, dinov2, Pair-VPR) are vendored in the repository.
-# Weights are hosted as a GitHub release — update RELEASE_URL after uploading.
-RELEASE_URL="https://github.com/ja1902/VPR/releases/download/v0.1.0"
+# Weights are downloaded from each model's official source.
+SALAD_URL="https://github.com/serizba/salad/releases/download/v1.0.0"
+DINOV2_URL="https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14"
+PAIRVPR_URL="https://huggingface.co/CSIRORobotics/Pair-VPR/resolve/main"
 
 echo
 echo "[3/6] Downloading model weights (~1.8 GB total)..."
@@ -73,10 +75,10 @@ download_weight() {
     fi
 }
 
-download_weight "$RELEASE_URL/dino_salad.ckpt"                   "weights/dino_salad.ckpt"
-download_weight "$RELEASE_URL/dinov2_vitb14_pretrain.pth"        "weights/dinov2_vitb14_pretrain.pth"
-download_weight "$RELEASE_URL/dinov2_vitb14_reg4_pretrain.pth"   "weights/dinov2_vitb14_reg4_pretrain.pth"
-download_weight "$RELEASE_URL/pairvpr-vitB.pth"                  "weights/pairvpr-vitB.pth"
+download_weight "$SALAD_URL/dino_salad.ckpt"                     "weights/dino_salad.ckpt"
+download_weight "$DINOV2_URL/dinov2_vitb14_pretrain.pth"         "weights/dinov2_vitb14_pretrain.pth"
+download_weight "$DINOV2_URL/dinov2_vitb14_reg4_pretrain.pth"    "weights/dinov2_vitb14_reg4_pretrain.pth"
+download_weight "$PAIRVPR_URL/pairvpr-vitB.pth"                  "weights/pairvpr-vitB.pth"
 
 # ── 4. Configure target region ───────────────────────────────────
 echo
