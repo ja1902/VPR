@@ -12,14 +12,12 @@ echo
 # ── 1. Check Python ──────────────────────────────────────────────
 PYTHON=""
 for cmd in python3 python; do
-    if command -v "$cmd" &>/dev/null; then
-        ver=$("$cmd" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null)
-        major=$("$cmd" -c "import sys; print(sys.version_info.major)" 2>/dev/null)
-        minor=$("$cmd" -c "import sys; print(sys.version_info.minor)" 2>/dev/null)
-        if [ "$major" -ge 3 ] && [ "$minor" -ge 10 ]; then
-            PYTHON="$cmd"
-            break
-        fi
+    # Run the version check inside the condition so a broken interpreter (e.g. the
+    # Windows Store "python3" stub) is skipped instead of tripping `set -e`.
+    if command -v "$cmd" &>/dev/null \
+        && "$cmd" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" &>/dev/null; then
+        PYTHON="$cmd"
+        break
     fi
 done
 
@@ -28,13 +26,6 @@ if [ -z "$PYTHON" ]; then
     exit 1
 fi
 echo "[1/6] Python: $($PYTHON --version)"
-
-# Check CUDA
-if $PYTHON -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
-    echo "       CUDA: available"
-else
-    echo "       CUDA: not detected (CPU mode — feature extraction will be slow)"
-fi
 
 # ── 2. Virtual environment ───────────────────────────────────────
 if [ ! -d "venv" ]; then
@@ -46,12 +37,24 @@ else
     echo "[2/6] Virtual environment already exists."
 fi
 
-source venv/bin/activate
-pip install --upgrade pip -q
+# Windows venvs put the activate script in Scripts/ instead of bin/
+if [ -f "venv/Scripts/activate" ]; then
+    source venv/Scripts/activate
+else
+    source venv/bin/activate
+fi
+python -m pip install --upgrade pip -q
 
 echo "       Installing dependencies..."
-pip install -r requirements.txt -q
+python -m pip install -r requirements.txt -q
 echo "       Done."
+
+# Check CUDA (after torch is installed in the venv)
+if python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null; then
+    echo "       CUDA: available"
+else
+    echo "       CUDA: not detected (CPU mode — feature extraction will be slow)"
+fi
 
 # ── 3. Download model weights ────────────────────────────────────
 # Model repos (salad, dinov2, Pair-VPR) are vendored in the repository.
