@@ -1,33 +1,41 @@
 """
 Extract DINOv2-SALAD global descriptors from clean perspective images.
+
+Descriptors are streamed to a float16 memory-mapped .npy file, so RAM use is constant
+regardless of how many reference images there are.
 """
 import json
 import pickle
 
 import numpy as np
-import torch
 from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from . import config
-from .model_utils import load_salad_model, get_transform
+from .model_utils import load_salad_model, get_transform, get_device
 
 
-def extract_batch(model, batch_tensors, device):
-    batch = torch.stack(batch_tensors).to(device)
-    with torch.no_grad():
-        descriptors = model(batch)
-    return descriptors.cpu().numpy()
+class ImageListDataset(Dataset):
+    def __init__(self, image_paths, transform):
+        self.image_paths = image_paths
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, i):
+        return self.transform(Image.open(self.image_paths[i]).convert("RGB"))
 
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
     print(f"Using device: {device}")
 
     clean_list_path = config.FEATURES_DIR / "clean_images.json"
     if not clean_list_path.exists():
         print(f"Clean image list not found at {clean_list_path}")
-        print("Run 03_filter.py first.")
+        print("Run python -m vpr.filter_images first.")
         return
 
     with open(clean_list_path) as f:
@@ -39,34 +47,35 @@ def main():
 
     print(f"Loading SALAD model...")
     model = load_salad_model(device)
-    transform = get_transform()
+    loader = DataLoader(
+        ImageListDataset(image_paths, get_transform()),
+        batch_size=config.BATCH_SIZE,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=device.type == "cuda",
+    )
     print(f"Model loaded. Extracting features from {len(image_paths)} images...")
 
-    all_descriptors = []
-    batch_tensors = []
-
-    for i, img_path in enumerate(tqdm(image_paths, desc="Extracting")):
-        img = Image.open(img_path).convert("RGB")
-        tensor = transform(img)
-        batch_tensors.append(tensor)
-
-        if len(batch_tensors) == config.BATCH_SIZE or i == len(image_paths) - 1:
-            descs = extract_batch(model, batch_tensors, device)
-            all_descriptors.append(descs)
-            batch_tensors = []
-
-    descriptors = np.vstack(all_descriptors)
-    print(f"Descriptor matrix shape: {descriptors.shape}")
-
     config.FEATURES_DIR.mkdir(parents=True, exist_ok=True)
-    desc_path = config.FEATURES_DIR / "descriptors.npy"
-    np.save(desc_path, descriptors)
+    descriptors = np.lib.format.open_memmap(
+        config.DESCRIPTORS_FILE, mode="w+", dtype=np.float16,
+        shape=(len(image_paths), config.SALAD_DIM),
+    )
+
+    offset = 0
+    for batch in tqdm(loader, desc="Extracting"):
+        descs = model(batch.to(device, non_blocking=True)).cpu().numpy()
+        descriptors[offset:offset + len(descs)] = descs
+        offset += len(descs)
+
+    descriptors.flush()
+    print(f"Descriptor matrix shape: {descriptors.shape} ({descriptors.dtype})")
+    del descriptors
 
     list_path = config.FEATURES_DIR / "image_list.pkl"
     with open(list_path, "wb") as f:
         pickle.dump(image_paths, f)
 
-    print(f"Saved descriptors to {desc_path}")
+    print(f"Saved descriptors to {config.DESCRIPTORS_FILE}")
     print(f"Saved image list to {list_path}")
 
 

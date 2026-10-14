@@ -10,15 +10,14 @@ Usage:
     python 06_query.py <image_path> --top_k 20 --rerank
 """
 import argparse
-import pickle
 
-import faiss
 import numpy as np
 import torch
 from PIL import Image
 
 from . import config
-from .model_utils import load_salad_model, get_transform
+from .model_utils import load_salad_model, get_transform, get_device
+from .search import ReferenceDB
 
 RERANK_MARGIN_THRESHOLD = 0.15
 OOR_PAIRVPR_THRESHOLD = 0.0
@@ -50,7 +49,7 @@ def weighted_centroid(ranked_items, top_m=CENTROID_TOP_M):
     return avg_lat, avg_lon
 
 
-def print_results(header, ranked_items, id_map):
+def print_results(header, ranked_items):
     print(f"\n{header}")
     print("-" * 80)
     for rank, item in enumerate(ranked_items, 1):
@@ -71,13 +70,8 @@ def print_results(header, ranked_items, id_map):
 
 
 def query(image_path, top_k=config.TOP_K, do_rerank=False):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    index_path = str(config.INDEX_DIR / "region.index")
-    index = faiss.read_index(index_path)
-
-    with open(config.INDEX_DIR / "id_map.pkl", "rb") as f:
-        id_map = pickle.load(f)
+    device = get_device()
+    ref_db = ReferenceDB()
 
     print(f"Loading SALAD model on {device}...")
     model = load_salad_model(device)
@@ -85,22 +79,14 @@ def query(image_path, top_k=config.TOP_K, do_rerank=False):
 
     img = Image.open(image_path).convert("RGB")
     tensor = transform(img).unsqueeze(0).to(device)
+    query_descriptor = model(tensor).cpu().numpy().astype(np.float32)
 
-    with torch.no_grad():
-        query_descriptor = model(tensor).cpu().numpy().astype(np.float32)
-
-    retrieval_k = max(top_k, 100) if do_rerank else top_k
-    distances, indices = index.search(query_descriptor, retrieval_k)
-
-    faiss_results = []
-    for dist, idx in zip(distances[0], indices[0]):
-        if idx == -1:
-            continue
-        meta = id_map[int(idx)]
-        faiss_results.append({"distance": float(dist), "meta": meta, "idx": int(idx)})
+    retrieval_k = max(top_k, config.PAIRVPR_CANDIDATES) if do_rerank else top_k
+    distances, indices = ref_db.search(query_descriptor, retrieval_k)
+    faiss_results = ref_db.results(distances[0], indices[0])
 
     print(f"\nQuery: {image_path}")
-    print_results(f"FAISS top {min(top_k, len(faiss_results))} matches:", faiss_results[:top_k], id_map)
+    print_results(f"FAISS top {min(top_k, len(faiss_results))} matches:", faiss_results[:top_k])
 
     faiss_lat, faiss_lon = weighted_centroid(faiss_results, CENTROID_TOP_M)
     if faiss_lat is not None:
@@ -127,35 +113,11 @@ def query(image_path, top_k=config.TOP_K, do_rerank=False):
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     print("\nLoading Pair-VPR for re-ranking...")
-    from .pairvpr_utils import load_pair_vpr_model, extract_dense_features, rerank
+    from .pairvpr_utils import rerank_results
 
-    pair_model = load_pair_vpr_model(device)
-    pair_transform = get_transform()
+    reranked_results = rerank_results(img, faiss_results, device)
 
-    query_img = Image.open(image_path).convert("RGB")
-    query_tensor = pair_transform(query_img).unsqueeze(0)
-    query_feats, _ = extract_dense_features(pair_model, query_tensor, device)
-
-    candidate_feats = []
-    for result in faiss_results:
-        cand_img = Image.open(result["meta"]["image_path"]).convert("RGB")
-        cand_tensor = pair_transform(cand_img).unsqueeze(0)
-        cand_feat, _ = extract_dense_features(pair_model, cand_tensor, device)
-        candidate_feats.append(cand_feat.squeeze(0))
-
-    candidate_feats = torch.stack(candidate_feats)
-    sorted_indices, sorted_scores = rerank(pair_model, query_feats, candidate_feats, device)
-
-    reranked_results = []
-    for i, (rerank_idx, score) in enumerate(zip(sorted_indices, sorted_scores)):
-        original = faiss_results[rerank_idx.item()]
-        reranked_results.append({
-            "score": score.item(),
-            "meta": original["meta"],
-            "original_rank": rerank_idx.item() + 1,
-        })
-
-    print_results(f"\nPair-VPR re-ranked top {min(top_k, len(reranked_results))}:", reranked_results[:top_k], id_map)
+    print_results(f"\nPair-VPR re-ranked top {min(top_k, len(reranked_results))}:", reranked_results[:top_k])
 
     best_score = reranked_results[0]["score"]
     print(f"\nOOR check: best Pair-VPR score={best_score:.4f} (threshold={OOR_PAIRVPR_THRESHOLD})")

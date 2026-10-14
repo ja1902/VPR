@@ -11,17 +11,16 @@ Usage:
     python 07_query_video.py <video_path> --crop 10,25 --rerank   # dashcam: trim 10% top, 25% bottom
 """
 import argparse
-import pickle
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import faiss
 import cv2
 from PIL import Image
 
 from . import config
-from .model_utils import load_salad_model, get_transform
+from .model_utils import load_salad_model, get_transform, get_device
+from .search import ReferenceDB
 from .query_image import (weighted_centroid, print_results,
                           RERANK_MARGIN_THRESHOLD, CENTROID_TOP_M)
 
@@ -129,18 +128,14 @@ def _find_largest_cluster(frame_locations, radius_m):
 def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
                 max_frames=config.VIDEO_MAX_FRAMES,
                 top_k=config.TOP_K, do_rerank=False, crop_pct=None):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = get_device()
 
     frames = extract_frames(video_path, sample_fps, max_frames, crop_pct)
     if not frames:
         print("No frames extracted from video.")
         return
 
-    index_path = str(config.INDEX_DIR / "region.index")
-    index = faiss.read_index(index_path)
-
-    with open(config.INDEX_DIR / "id_map.pkl", "rb") as f:
-        id_map = pickle.load(f)
+    ref_db = ReferenceDB()
 
     print(f"Loading SALAD model on {device}...")
     model = load_salad_model(device)
@@ -148,31 +143,26 @@ def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
 
     tensors = torch.stack([transform(f) for f in frames])
 
-    with torch.no_grad():
-        all_descriptors = []
-        batch_size = min(config.BATCH_SIZE, 8)
-        for i in range(0, len(tensors), batch_size):
-            batch = tensors[i:i + batch_size].to(device)
-            desc = model(batch)
-            all_descriptors.append(desc.cpu())
-        descriptors = torch.cat(all_descriptors, dim=0)  # (L, 8448)
+    all_descriptors = []
+    batch_size = min(config.BATCH_SIZE, 8)
+    for i in range(0, len(tensors), batch_size):
+        batch = tensors[i:i + batch_size].to(device)
+        desc = model(batch)
+        all_descriptors.append(desc.cpu())
+    descriptors = torch.cat(all_descriptors, dim=0)  # (L, 8448)
 
     print(f"Computed {descriptors.shape[0]} frame descriptors ({descriptors.shape[1]}-dim)")
 
     frame_descriptors = descriptors.numpy().astype(np.float32)
-    per_frame_k = max(top_k, 100) if do_rerank else top_k
-    distances, indices = index.search(frame_descriptors, per_frame_k)
+    per_frame_k = max(top_k, config.PAIRVPR_CANDIDATES) if do_rerank else top_k
+    distances, indices = ref_db.search(frame_descriptors, per_frame_k)
 
     frame_locations = []
     frame_results = []
     print(f"\nQuery: {video_path}")
     print(f"\nPer-frame top-1 matches:")
     for f_idx in range(len(frames)):
-        results = []
-        for dist, idx in zip(distances[f_idx], indices[f_idx]):
-            if idx == -1:
-                continue
-            results.append({"distance": float(dist), "meta": id_map[int(idx)], "idx": int(idx)})
+        results = ref_db.results(distances[f_idx], indices[f_idx])
         frame_results.append(results)
 
         if results:
@@ -214,7 +204,7 @@ def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
     faiss_results = sorted(merged.values(), key=lambda r: r["distance"])
 
     print_results(f"Merged top {min(top_k, len(faiss_results))} from inlier frames:",
-                  faiss_results[:top_k], id_map)
+                  faiss_results[:top_k])
 
     faiss_lat, faiss_lon = weighted_centroid(faiss_results, CENTROID_TOP_M)
     if faiss_lat is not None:
@@ -241,35 +231,12 @@ def query_video(video_path, sample_fps=config.VIDEO_SAMPLE_FPS,
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     print("\nLoading Pair-VPR for re-ranking...")
-    from .pairvpr_utils import load_pair_vpr_model, extract_dense_features, rerank
-
-    pair_model = load_pair_vpr_model(device)
-    pair_transform = get_transform()
+    from .pairvpr_utils import rerank_results
 
     best_frame_idx = sorted(inlier_frame_indices)[0]
-    query_tensor = pair_transform(frames[best_frame_idx]).unsqueeze(0)
-    query_feats, _ = extract_dense_features(pair_model, query_tensor, device)
+    reranked_results = rerank_results(frames[best_frame_idx], faiss_results, device)
 
-    candidate_feats = []
-    for result in faiss_results:
-        cand_img = Image.open(result["meta"]["image_path"]).convert("RGB")
-        cand_tensor = pair_transform(cand_img).unsqueeze(0)
-        cand_feat, _ = extract_dense_features(pair_model, cand_tensor, device)
-        candidate_feats.append(cand_feat.squeeze(0))
-
-    candidate_feats = torch.stack(candidate_feats)
-    sorted_indices, sorted_scores = rerank(pair_model, query_feats, candidate_feats, device)
-
-    reranked_results = []
-    for rerank_idx, score in zip(sorted_indices, sorted_scores):
-        original = faiss_results[rerank_idx.item()]
-        reranked_results.append({
-            "score": score.item(),
-            "meta": original["meta"],
-            "original_rank": rerank_idx.item() + 1,
-        })
-
-    print_results(f"\nPair-VPR re-ranked top {min(top_k, len(reranked_results))}:", reranked_results[:top_k], id_map)
+    print_results(f"\nPair-VPR re-ranked top {min(top_k, len(reranked_results))}:", reranked_results[:top_k])
 
     rerank_lat, rerank_lon = weighted_centroid(reranked_results, CENTROID_TOP_M)
     if rerank_lat is not None:

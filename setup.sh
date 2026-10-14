@@ -64,7 +64,7 @@ DINOV2_URL="https://dl.fbaipublicfiles.com/dinov2/dinov2_vitb14"
 PAIRVPR_URL="https://huggingface.co/CSIRORobotics/Pair-VPR/resolve/main"
 
 echo
-echo "[3/6] Downloading model weights (~1.8 GB total)..."
+echo "[3/6] Downloading model weights (~1.5 GB total)..."
 mkdir -p weights
 
 download_weight() {
@@ -79,7 +79,6 @@ download_weight() {
 }
 
 download_weight "$SALAD_URL/dino_salad.ckpt"                     "weights/dino_salad.ckpt"
-download_weight "$DINOV2_URL/dinov2_vitb14_pretrain.pth"         "weights/dinov2_vitb14_pretrain.pth"
 download_weight "$DINOV2_URL/dinov2_vitb14_reg4_pretrain.pth"    "weights/dinov2_vitb14_reg4_pretrain.pth"
 download_weight "$PAIRVPR_URL/pairvpr-vitB.pth"                  "weights/pairvpr-vitB.pth"
 
@@ -101,9 +100,7 @@ fi
 if [ -z "$SKIP_CONFIG" ]; then
     echo
     echo "  Enter the bounding box for the area you want to cover."
-    echo "  Use decimal degrees (WGS84). Example for a city centre:"
-    echo "    SW corner: 51.435, -2.615"
-    echo "    NE corner: 51.475, -2.545"
+    echo "  Use decimal degrees (WGS84): latitude -90..90, longitude -180..180."
     echo
 
     read -p "  Min latitude  (south boundary): " MIN_LAT

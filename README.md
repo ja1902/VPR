@@ -67,7 +67,7 @@ The system now detects when a query is outside the reference area instead of sil
 **Core components:**
 
 - **DINOv2-SALAD** — Produces 8448-dimensional global descriptors that capture visual identity of a scene, invariant to lighting and viewpoint changes
-- **FAISS IndexFlatL2** — Brute-force L2 search over the reference descriptor database for fast nearest-neighbour retrieval
+- **Compressed FAISS index + exact re-scoring** — A PCA-2048 + 8-bit quantized FAISS index (~2 KB per image instead of 33 KB) produces a shortlist of 1024 candidates, which is re-scored with exact L2 against the full float16 descriptors memory-mapped from disk. Metadata is looked up in SQLite. See [Memory and index tuning](#memory-and-index-tuning)
 - **Pair-VPR** — Cross-attention re-ranker using DINOv2 ViT-B/14 dense features, triggered adaptively when FAISS results are ambiguous (top-1/top-2 margin < 0.15)
 - **Per-frame voting** — Video queries search each frame independently; geographic clustering of per-frame matches determines consensus and filters outliers
 - **Weighted centroid** — Final coordinates computed as a weighted average of the top-M matches
@@ -97,7 +97,7 @@ git clone https://github.com/ja1902/VPR.git && cd VPR
 
 The setup script will:
 1. Create a virtual environment and install dependencies
-2. Download pre-trained weights (~1.8 GB from the official SALAD, DINOv2 and Pair-VPR sources)
+2. Download pre-trained weights (~1.5 GB from the official SALAD, DINOv2 and Pair-VPR sources)
 3. Ask you for the bounding box of the area you want to cover
 4. Build the reference database (harvest panoramas, extract features, build index)
 
@@ -161,7 +161,7 @@ VPR/
     ├── panoramas/            # Raw street-level panoramas
     ├── perspectives/         # Reprojected perspective images
     ├── features/             # SALAD descriptor arrays
-    └── index/                # FAISS index + ID map
+    └── index/                # FAISS index + references.sqlite (per-image metadata)
 ```
 
 ## Configuration
@@ -169,10 +169,10 @@ VPR/
 The `.env` file controls the target region:
 
 ```env
-MIN_LAT=51.435      # South boundary
-MAX_LAT=51.475      # North boundary
-MIN_LON=-2.615      # West boundary
-MAX_LON=-2.545      # East boundary
+MIN_LAT=<south>     # South boundary (decimal degrees)
+MAX_LAT=<north>     # North boundary
+MIN_LON=<west>      # West boundary
+MAX_LON=<east>      # East boundary
 GRID_STEP_M=20      # Sampling density in meters
 ```
 
@@ -183,6 +183,53 @@ python -m vpr.harvest
 python -m vpr.filter_images
 python -m vpr.extract_features
 python -m vpr.build_index
+```
+
+If you upgrade from a version that wrote `id_map.pkl`, just re-run `python -m vpr.build_index`; existing descriptors are reused.
+
+## Memory and index tuning
+
+Models run in float16 on CUDA. Peak VRAM, measured on a T4:
+
+| Stage | Before | Now |
+|-------|--------|-----|
+| SALAD, 1 image | 0.48 GB | 0.32 GB |
+| SALAD, batch of 32 (feature extraction) | 2.0 GB | 0.52 GB |
+| Pair-VPR re-ranking of 100 candidates | 4.9 GB | 0.66 GB |
+
+Any CUDA GPU with 2 GB or more is enough. Set `USE_FP16=0` to run in float32 (VRAM use about doubles).
+
+RAM at query time scales with the index, not with the full descriptors:
+
+| References | Old FlatL2 index | `PCA2048,SQ8` index | Descriptors on disk (fp16, memory-mapped) |
+|-----------|------------------|---------------------|------------------------------------------|
+| 114k (test area) | 3.7 GB | 0.29 GB | 1.9 GB |
+| 1M | 34 GB | ~2.1 GB | 17 GB |
+
+On a test area with 113,746 references and 190 real photo and video-frame queries, the new
+search returned the same top-1 and top-10 as exact FlatL2 search for every query. It found
+99.3% of the exact top-100, and re-rank decisions were unchanged.
+
+Feature extraction writes descriptors straight to disk and index building trains on a
+50k sample, then adds vectors in chunks, so neither step needs the whole database in RAM.
+
+Settings can be put in `.env` or set as environment variables:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `USE_FP16` | `1` | Half-precision models on CUDA |
+| `BATCH_SIZE` | `32` | SALAD batch size for feature extraction (lower it on very small GPUs) |
+| `NUM_WORKERS` | `4` | Image-loading worker processes for feature extraction |
+| `PAIRVPR_BATCH_SIZE` | `16` | Candidate pairs scored per Pair-VPR forward pass |
+| `INDEX_FACTORY` | auto | FAISS [index factory](https://github.com/facebookresearch/faiss/wiki/The-index-factory) string. Auto picks `Flat` for tiny areas, `PCA2048,SQ8` up to 2M images, and `PCA2048,IVFn,SQ8` above that |
+| `INDEX_PCA_DIM` | `2048` | PCA dimensions kept in the index (lower means less RAM but lower recall; `INDEX_FACTORY=SQ8` skips PCA for exact-equivalent results at ~8.4 KB/image) |
+| `SHORTLIST_K` | `1024` | Candidates taken from the compressed index and re-scored exactly |
+| `INDEX_NPROBE` | `64` | Inverted lists scanned per query (IVF indexes only) |
+
+After changing index settings, rebuild the index and check shortlist recall against exact search:
+
+```bash
+python -m vpr.build_index --eval 200
 ```
 
 ## Limitations
